@@ -1,0 +1,913 @@
+---
+title: "project_stanowski"
+output: html_document
+date: "2025-04-19"
+---
+
+```{r setup, include=FALSE}
+all_times <- list()  
+knitr::knit_hooks$set(time_it = local({
+  now <- NULL
+  function(before, options) {
+    if (before) {
+      now <<- Sys.time()
+    } else {
+      res <- difftime(Sys.time(), now, units = "secs")
+      all_times[[options$label]] <<- res
+    }
+  }
+}))
+knitr::opts_chunk$set(
+  tidy = TRUE,
+  tidy.opts = list(width.cutoff = 95),
+  message = FALSE,
+  warning = FALSE,
+  time_it = TRUE
+)
+```
+
+## R Markdown
+
+```{r libraries}
+library(Seurat)
+library(reticulate)
+library(ggplot2)
+library(dplyr)
+library(vegan)
+library(GEOquery)
+library(readxl)
+library(org.Hs.eg.db)
+library(AnnotationDbi)
+library(purrr)
+library(tibble)
+library(pheatmap)
+
+```
+
+```{r init}
+pbmc_exp.data <- Read10X(data.dir = "C:/Users/Michał/Documents/Studia/StudiaMagisterskie/Bioinformatyka/RokISemII/CBS/cbs/project/matrices/")
+pbmc_con.data <- Read10X(data.dir = "C:/Users/Michał/Documents/Studia/StudiaMagisterskie/Bioinformatyka/RokISemII/CBS/cbs/project/filtered_feature_bc_matrix")
+pbmc_exp <- CreateSeuratObject(counts = pbmc_exp.data, min.cells = 3, min.features = 200)
+pbmc_con <- CreateSeuratObject(counts = pbmc_con.data, min.cell = 3, min.features = 200)
+
+pbmc_exp[["percent.mt"]] <- PercentageFeatureSet(pbmc_exp, pattern = "^MT-")
+pbmc_con[["percent.mt"]] <- PercentageFeatureSet(pbmc_con, pattern = "^MT-")
+pbmc_exp[["percent.mt"]] 
+pbmc_con[["percent.mt"]]
+
+head(pbmc_exp@meta.data, 5)
+head(pbmc_con@meta.data, 5)
+
+```
+
+```{r qc}
+
+VlnPlot(pbmc_exp, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+VlnPlot(pbmc_con, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+
+plot1_exp <- FeatureScatter(pbmc_exp, feature1 = "nCount_RNA", feature2 = "percent.mt") 
+plot2_exp <- FeatureScatter(pbmc_exp, feature1 = "nCount_RNA", feature2 = "nFeature_RNA") 
+plot1_exp + plot2_exp
+
+plot1_con <- FeatureScatter(pbmc_con, feature1 = "nCount_RNA", feature2 = "percent.mt") 
+plot2_con <- FeatureScatter(pbmc_con, feature1 = "nCount_RNA", feature2 = "nFeature_RNA") 
+plot1_con+ plot2_con
+
+pbmc_exp <- subset(pbmc_exp, subset = nFeature_RNA > 500 & nFeature_RNA < 6000 & percent.mt < 15) # change the cutoff
+pbmc_con <- subset(pbmc_con, subset = nFeature_RNA > 300 & nFeature_RNA < 5000 & percent.mt < 25) # change the cutoff
+```
+
+```{r scrublet}
+
+py_config()
+py_install("scrublet", pip=TRUE)
+py_module_available("scrublet")  
+
+pbmc_exp_matrix <- as.matrix(GetAssayData(pbmc_exp, slot = "counts"))
+pbmc_con_matrix <- as.matrix(GetAssayData(pbmc_con, slot = "counts"))
+
+counts_exp <- as(pbmc_exp_matrix, "dgCMatrix")
+counts_con <- as(pbmc_con_matrix, "dgCMatrix")
+
+py$counts_exp <- t(as.matrix(counts_exp))
+py$counts_con <- t(as.matrix(counts_con))
+py_run_string("import sys; sys.modules.pop('scrublet', None)")
+scrublet <- import("scrublet", convert = FALSE)
+print(scrublet)
+
+scrub_exp <- scrublet$Scrublet(py$counts_exp)
+scrub_con <- scrublet$Scrublet(py$counts_con)
+
+scrub_results_exp <- scrub_exp$scrub_doublets()
+scrub_results_con <- scrub_con$scrub_doublets()
+
+doublet_scores_exp <- as.vector(scrub_results_exp[[1]])
+doublet_scores_con <- as.vector(scrub_results_con[[1]])
+
+threshold <- 0.25
+predicted_doublets_exp <- doublet_scores_exp > threshold
+predicted_doublets_con <- doublet_scores_con > threshold
+
+pbmc_exp$doublet_scores <- doublet_scores_exp
+pbmc_exp$predicted_doublet <- predicted_doublets_exp
+
+pbmc_con$doublet_scores <- doublet_scores_con
+pbmc_con$predicted_doublet <- predicted_doublets_con
+
+pbmc_exp <- subset(pbmc_exp, subset = predicted_doublet == FALSE)
+pbmc_con <- subset(pbmc_con, subset = predicted_doublet == FALSE)
+
+liczba_dubletow_exp <- sum(predicted_doublets_exp)
+liczba_dubletow_con <- sum(predicted_doublets_con)
+
+print(paste("Number of doublets in PBMC_EXP:", liczba_dubletow_exp))
+print(paste("Number of doublets in PBMC_CON:", liczba_dubletow_con))
+
+saveRDS(pbmc_exp, file = "pbmc_exp_no_doublets.rds")
+saveRDS(pbmc_con, file = "pbmc_con_no_doublets.rds")
+```
+
+```{r obtaining_the_same_results}
+
+pbmc_con <- readRDS("pbmc_con_no_doublets.rds")
+pbmc_exp <- readRDS("pbmc_exp_no_doublets.rds")
+
+metadata <- read.csv("C:/Users/Michał/Documents/Studia/StudiaMagisterskie/Bioinformatyka/RokISemII/CBS/cbs/project/matrices/cell_batch.csv.gz")
+
+metadata$stage[grepl("P1|P2", metadata$batch) & grepl("day1", metadata$batch)] <- "severe"
+metadata$stage[grepl("P1|P2", metadata$batch) & (grepl("day5", metadata$batch) | grepl("day7", metadata$batch))] <- "reemission"
+
+rownames(metadata) <- metadata$X
+
+pbmc_exp$stage <- metadata[colnames(pbmc_exp), "stage"]
+
+table(pbmc_exp$stage, useNA = "ifany")
+
+pbmc_con <- NormalizeData(pbmc_con)
+pbmc_exp <- NormalizeData(pbmc_exp)
+
+pbmc_con <- FindVariableFeatures(pbmc_con, selection.method = "vst", nfeatures = 5000)
+pbmc_exp <- FindVariableFeatures(pbmc_exp, selection.method = "vst", nfeatures = 5000)
+
+pbmc_con <- ScaleData(pbmc_con)
+pbmc_con <- RunPCA(pbmc_con, npcs = 40)
+
+pbmc_exp <- ScaleData(pbmc_exp)
+pbmc_exp <- RunPCA(pbmc_exp, npcs = 40)
+
+pbmc_con$group <- "Control"
+pbmc_exp$group <- "Experiment"
+
+pbmc_list <- list(pbmc_con, pbmc_exp)
+
+anchors <- FindIntegrationAnchors(object.list = pbmc_list, dims = 1:40, reduction = "rpca")
+
+pbmc_integrated <- IntegrateData(anchorset = anchors, dims = 1:40)
+
+DefaultAssay(pbmc_integrated) <- "integrated"
+pbmc_integrated <- ScaleData(pbmc_integrated)
+pbmc_integrated <- RunPCA(pbmc_integrated, npcs = 50)
+pbmc_integrated <- RunUMAP(pbmc_integrated, dims = 1:50)
+pbmc_integrated <- FindNeighbors(pbmc_integrated, dims = 1:50)
+pbmc_integrated <- FindClusters(pbmc_integrated, resolution = 0.3)
+
+c <- DimPlot(pbmc_integrated, reduction = "umap", group.by = "seurat_clusters", label = TRUE) + ggtitle("Integrated (RPCA)")
+
+# ggsave("clusters_no_labels_25.png", c, width = 10, height = 12, dpi = 300)
+
+saveRDS(pbmc_integrated, file="pbmc_integrated_25.rds")
+```
+
+```{r umap_mapping}
+
+pbmc_integrated_normal <- readRDS("pbmc_integrated_1.rds")
+
+umap1 <- Embeddings(pbmc_integrated, reduction = "umap")
+umap2 <- Embeddings(pbmc_integrated_normal, reduction = "umap")
+
+common_cells <- intersect(rownames(umap1), rownames(umap2))
+umap1_common <- umap1[common_cells, ]
+umap2_common <- umap2[common_cells, ]
+
+cor_x <- cor(umap1_common[,1], umap2_common[,1])
+cor_y <- cor(umap1_common[,2], umap2_common[,2])
+print(c(cor_x, cor_y))
+
+euclidean_diff <- sqrt(rowSums((umap1_common - umap2_common)^2))
+mean_diff <- mean(euclidean_diff)
+print(mean_diff)
+
+proc <- procrustes(umap1_common, umap2_common)
+summary(proc)
+plot(proc)
+
+df <- data.frame(
+  x1 = umap1_common[,1],
+  y1 = umap1_common[,2],
+  x2 = umap2_common[,1],
+  y2 = umap2_common[,2]
+)
+
+ggplot(df) +
+  geom_segment(aes(x = x1, y = y1, xend = x2, yend = y2),
+               arrow = arrow(length = unit(0.1, "inches")),
+               alpha = 0.3) +
+  theme_minimal() +
+  labs(title = "UMAP shift per cell (before alignment)")
+
+
+count_severe_percentage <- function(seurat_obj) {
+  Idents(seurat_obj) <- "seurat_clusters"
+  cluster_x_cells <- WhichCells(seurat_obj, idents = "11") # change to number of interest
+  meta <- seurat_obj@meta.data[cluster_x_cells, ]
+  total_cells <- nrow(meta)
+  severe_cells <- sum(meta$stage == "severe", na.rm = TRUE)
+  percent <- round(100 * severe_cells / total_cells, 2)
+  return(list(
+    severe_count = severe_cells,
+    total_count = total_cells,
+    percent = percent
+  ))
+}
+
+res_normal <- count_severe_percentage(pbmc_integrated_normal)
+res_main   <- count_severe_percentage(pbmc_integrated)
+
+cat("pbmc_integrated_normal:\n",
+    "  severe:", res_normal$severe_count, "/", res_normal$total_count,
+    "(", res_normal$percent, "%)\n")
+
+cat("pbmc_integrated:\n",
+    "  severe:", res_main$severe_count, "/", res_main$total_count,
+    "(", res_main$percent, "%)\n")
+
+
+```
+
+```{r violin_plots}
+markers <- FindAllMarkers(pbmc_integrated, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+
+top_markers <- markers %>%
+  group_by(cluster) %>%
+  top_n(n = 5, wt = avg_log2FC)
+
+head(top_markers)
+
+genes_to_plot <- c("PTPRC", "CD14", "FCGR3A", "CD3D", "IL7R", "CCR7", "CD8A", 
+                   "MKI67", "TRGC1", "NKG7", "CD79A", "CD38", "CD1C", "CLEC4C", 
+                   "PPBP", "CD34")
+
+vln_plot <- VlnPlot(pbmc_integrated, 
+                 features = genes_to_plot, 
+                 group.by = "seurat_clusters", 
+                    pt.size = 0, 
+                    stack = TRUE, 
+                    flip = TRUE) +  
+  ggtitle("Ekspresja markerów w klastrach")
+
+
+# ggsave("marker_violin_plot_25.png", vln_plot, width = 10, height = 12, dpi = 300)
+
+
+```
+
+```{r marker_plots}
+
+celltype_labels <- c(
+  "0"  = "Naive CD4+ T",
+  "1"  = "CD14+ Mono",
+  "2"  = "Naive CD8+ T",
+  "3"  = "Effector CD4+ T",
+  "4"  = "B",
+  "5"  = "Effector CD8+ T",
+  "6"  = "NK",
+  "7"  = "Effector CD4+ T",
+  "8"  = "B",
+  "9"  = "Effector CD4+ T",
+  "10" = "γδ T",
+  "11" = "Effector CD8+ T",
+  "12" = "CD14+ Mono",
+  "13" = "mDC",
+  "14" = "Plasma B",
+  "15" = "MKI67+ CD8+ T",
+  "16" = "CD16+ Mono",
+  "17" = "Platelet",
+  "18" = "pDC",
+  "19" = "CD14+ Mono",
+  "20" = "Progenitor",
+  "21" = "Unknown"
+)
+
+
+cell_names <- colnames(pbmc_integrated)
+
+cluster_ids <- as.character(pbmc_integrated$seurat_clusters)
+
+celltype_vector <- celltype_labels[cluster_ids]
+
+celltype_df <- data.frame(celltype = celltype_vector)
+rownames(celltype_df) <- cell_names
+
+pbmc_integrated <- AddMetaData(pbmc_integrated, metadata = celltype_df)
+
+Idents(pbmc_integrated) <- pbmc_integrated$celltype
+
+celltype_plot <- DimPlot(pbmc_integrated, reduction = "umap", group.by = "celltype", 
+                         label = TRUE, repel = TRUE, raster = FALSE) +
+  ggtitle("UMAP with cell types") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+# ggsave("celltype_dimplot_25.png", celltype_plot, width = 10, height = 8, dpi = 300)
+
+p <- DimPlot(pbmc_integrated, reduction = "umap", group.by = "group", 
+        cols = c("steelblue", "firebrick"), 
+        pt.size = 0.5) +
+  ggtitle("UMAP: control vs experiment") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+# ggsave("umap_control_vs_experiment_25.png", plot = p, width = 8, height = 6, dpi = 300)
+
+pbmc_integrated@meta.data$stage <- as.character(pbmc_integrated@meta.data$stage)  
+pbmc_integrated@meta.data$stage[is.na(pbmc_integrated@meta.data$stage)] <- "Control"
+pbmc_integrated@meta.data$stage <- factor(pbmc_integrated@meta.data$stage)  
+
+p <- DimPlot(pbmc_integrated, reduction = "umap", group.by = "stage", 
+        cols = c("steelblue", "firebrick", "green"), 
+        pt.size = 0.5) +
+  ggtitle("UMAP: control vs experiment (severe vs reemission stage)") +
+  theme(plot.title = element_text(hjust = 0.5))
+ggsave("umap_control_vs_experiment_re_se_25.png", plot = p, width = 8, height = 6, dpi = 300)
+
+
+```
+
+```{r subcluster_analysis}
+
+Idents(pbmc_integrated) <- pbmc_integrated@meta.data$seurat_clusters
+cluster11_cells <- WhichCells(pbmc_integrated, idents = 12)
+pbmc_cluster11 <- subset(pbmc_integrated, cells = cluster11_cells)
+
+pca_embeddings <- Embeddings(pbmc_cluster11, reduction = "pca")[, 1:10]
+
+wss <- numeric(15) 
+
+set.seed(123)  
+
+for (k in 1:15) {
+  km <- kmeans(pca_embeddings, centers = k, nstart = 25)
+  wss[k] <- km$tot.withinss
+}
+
+elbow_df <- data.frame(k = 1:15, WSS = wss)
+
+ggplot(elbow_df, aes(x = k, y = WSS)) +
+  geom_point() + geom_line() +
+  scale_x_continuous(breaks = 1:15) +
+  labs(title = "Elbow method",
+       x = "Number of clusters [k]",
+       y = "Sum of squares") +
+  theme_minimal()
+
+kmeans_result <- kmeans(pca_embeddings, centers = 3, nstart = 25)
+
+pbmc_cluster11$kmeans_clusters <- as.factor(kmeans_result$cluster)
+
+DimPlot(pbmc_cluster11, reduction = "umap", group.by = "kmeans_clusters", 
+        pt.size = 0.5) +
+  ggtitle("K-means clustering (k=3) of cluster 11") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+Idents(pbmc_cluster11) <- pbmc_cluster11$kmeans_clusters
+
+markers <- FindAllMarkers(pbmc_cluster11, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+
+top_genes_cluster1 <- head(markers[markers$cluster == "1", ], 3)$gene
+top_genes_cluster2 <- head(markers[markers$cluster == "2", ], 3)$gene
+top_genes_cluster3 <- head(markers[markers$cluster == "3", ], 3)$gene
+
+genes_to_plot <- unique(c(top_genes_cluster1, top_genes_cluster2, top_genes_cluster3))
+
+print(genes_to_plot)
+
+VlnPlot(pbmc_cluster11, features = genes_to_plot, pt.size = 0.1)
+
+p <- VlnPlot(pbmc_cluster11, features = genes_to_plot, pt.size = 0.1) + 
+     theme(axis.text=element_text(size=14),
+           axis.title=element_text(size=16),
+           plot.title=element_text(size=18, hjust=0.5))
+
+# ggsave("violin_plot_kmeans_clusters.png", plot = p, width = 12, height = 8, dpi = 300)
+
+head(pbmc_cluster11@meta.data)
+
+p <- DimPlot(pbmc_cluster11, reduction = "umap", group.by = "stage", pt.size = 0.5) +
+  ggtitle("UMAP of cluster 9: batch effect (stage)") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+# ggsave("umap_batch_effect_reemission_severe.png", plot = p, width = 8, height = 6, dpi = 300)
+
+cluster_cells <- colnames(pbmc_cluster11)
+meta_subset <- metadata[metadata$X %in% cluster_cells, ]
+meta_subset$patient <- sub("-.*", "", meta_subset$batch)
+table(meta_subset$patient)
+rownames(meta_subset) <- meta_subset$X
+
+pbmc_cluster11@meta.data$patient <- meta_subset[rownames(pbmc_cluster11@meta.data), "patient"]
+pbmc_cluster11@meta.data$patient[is.na(pbmc_cluster11@meta.data$patient)] <- "control"
+
+all(rownames(pbmc_cluster11@meta.data) %in% meta_subset$X)
+
+p <- DimPlot(pbmc_cluster11, reduction = "umap", group.by = "patient", pt.size = 0.5) +
+  ggtitle("UMAP of cluster 11: batch effect") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+# ggsave("umap_batcheffect_P1P2.png", plot = p, width = 8, height = 6, dpi = 300)
+
+# saveRDS(pbmc_integrated, file = "pbmc_integrated_1.rds")
+# saveRDS(pbmc_cluster11, file = "pbmc_cluster11.rds")
+
+
+```
+
+```{r pub_datasets SepticShock}
+
+monocyte_cluster <- readRDS("pbmc_cluster11.rds")
+markers <- FindAllMarkers(monocyte_cluster, only.pos=TRUE)
+
+top_markers <- markers %>%
+  filter(avg_log2FC > 1, pct.1 > 0.6) %>%
+  top_n(3, wt = avg_log2FC) %>%
+  pull(gene)
+raw_counts <- read_excel("GSE131411_rawcounts_CS_SS.xlsx")
+gene_names <- raw_counts[[1]]
+expr_matrix <- as.matrix(raw_counts[ , -1])
+rownames(expr_matrix) <- gene_names
+
+sample_names <- colnames(expr_matrix)
+condition <- rep(NA, length(sample_names))
+names(condition) <- sample_names
+
+condition[grep("^E07T|^E16T|^E17T|^E32T|^E40T|^E41T|^G01T|^G07T|^G11T|^G12T|^G26T|^G28T|^G29T|^G33T|^G35T|^G42T|^G43T|^G44T|^G45T|^G47T|^G49T", sample_names)] <- "SepticShock"
+condition[grep("^E25T|^E31T|^G03T|^G10T|^G14T|^G16T|^G24T|^G32T|^G46T|^G48T|^G50T", sample_names)] <- "CardiogenicShock"
+
+meta_data <- data.frame(Sample = sample_names, Condition = condition, row.names = sample_names)
+
+sepsis_seurat <- CreateSeuratObject(counts = expr_matrix, meta.data = meta_data)
+
+ensembl_ids <- rownames(sepsis_seurat)
+gene_symbols <- mapIds(org.Hs.eg.db,
+                       keys = ensembl_ids,
+                       column = "SYMBOL",
+                       keytype = "ENSEMBL",
+                       multiVals = "first")
+
+new_names <- ifelse(is.na(gene_symbols), ensembl_ids, gene_symbols)
+
+if(any(duplicated(new_names))){
+  new_names <- make.unique(new_names)
+}
+
+rownames(sepsis_seurat) <- new_names
+
+sepsis_seurat <- NormalizeData(sepsis_seurat)
+sepsis_seurat <- FindVariableFeatures(sepsis_seurat)
+sepsis_seurat <- ScaleData(sepsis_seurat)
+sepsis_seurat <- RunPCA(sepsis_seurat)
+sepsis_seurat <- FindNeighbors(sepsis_seurat, dims = 1:10)
+sepsis_seurat <- FindClusters(sepsis_seurat, resolution = 0.5)
+sepsis_seurat <- RunUMAP(sepsis_seurat, dims = 1:10)
+
+DimPlot(sepsis_seurat, reduction = "umap", label = TRUE)
+
+cluster_markers <- FindAllMarkers(sepsis_seurat, 
+                                  only.pos = TRUE, 
+                                  min.pct = 0.25, 
+                                  logfc.threshold = 0.25)
+
+intersected_markers <- cluster_markers[cluster_markers$gene %in% top_markers, ]
+
+head(intersected_markers)
+
+DoHeatmap(sepsis_seurat, features = intersected_markers$gene) + NoLegend()
+
+DotPlot(sepsis_seurat, features = unique(intersected_markers$gene)) + RotatedAxis()
+
+genes_of_interest <- unique(intersected_markers$gene)
+
+expr_sub <- FetchData(sepsis_seurat, vars = genes_of_interest)
+
+cells_expressing_any <- rowSums(expr_sub > 0) > 0
+
+sepsis_seurat$ExpressingIntersected <- ifelse(cells_expressing_any, "Yes", "No")
+
+DimPlot(sepsis_seurat, group.by = "ExpressingIntersected", reduction = "umap",
+        pt.size = 0.6) +
+  ggtitle("Cells expressing any intersected marker gene") +
+  scale_color_manual(values = c("No" = "lightgrey", "Yes" = "red"))
+
+```
+
+
+```{r influenza_analysis}
+
+influenza_samples <-  list(
+  IA1 = "~/Studia/StudiaMagisterskie/Bioinformatyka/RokISemII/CBS/cbs/project/GSE243629_RAW/GSM7792037_IC_1_EmptyDrops_CR_matrix/",
+  IA2 = "~/Studia/StudiaMagisterskie/Bioinformatyka/RokISemII/CBS/cbs/project/GSE243629_RAW/GSM7792038_IC_2_EmptyDrops_CR_matrix/",
+  IC1 = "~/Studia/StudiaMagisterskie/Bioinformatyka/RokISemII/CBS/cbs/project/GSE243629_RAW/GSM7792039_IA_1_EmptyDrops_CR_matrix/",
+  IC2 = "~/Studia/StudiaMagisterskie/Bioinformatyka/RokISemII/CBS/cbs/project/GSE243629_RAW/GSM7792040_IA_2_EmptyDrops_CR_matrix/",
+  PI1 = "~/Studia/StudiaMagisterskie/Bioinformatyka/RokISemII/CBS/cbs/project/GSE243629_RAW/GSM7792041_PI_1_EmptyDrops_CR_matrix/",
+  PI2 = "~/Studia/StudiaMagisterskie/Bioinformatyka/RokISemII/CBS/cbs/project/GSE243629_RAW/GSM7792042_PI_2_EmptyDrops_CR_matrix/",
+  PI3 = "~/Studia/StudiaMagisterskie/Bioinformatyka/RokISemII/CBS/cbs/project/GSE243629_RAW/GSM7792043_PI_3_EmptyDrops_CR_matrix/"
+)
+
+
+seurat_list <- lapply(names(influenza_samples), function(id) {
+  data <- Read10X(data.dir = influenza_samples[[id]])
+  seu <- CreateSeuratObject(counts = data, project = id)
+  seu$SampleID <- id
+  seu$Condition <- substr(id, 1, 2)  
+  return(seu)
+})
+
+combined <- merge(seurat_list[[1]], y = seurat_list[-1], add.cell.ids = names(influenza_samples))
+
+combined <- NormalizeData(combined)
+combined <- FindVariableFeatures(combined)
+combined <- ScaleData(combined)
+combined <- RunPCA(combined)
+combined <- FindNeighbors(combined, dims = 1:10)
+combined <- FindClusters(combined, resolution = 0.5)
+combined <- RunUMAP(combined, dims = 1:10)
+
+DimPlot(combined, group.by = "Condition", label = TRUE) + ggtitle("PBMCs: IC vs IA vs PI")
+
+pbmc_integrated <- readRDS("pbmc_integrated_1.rds")
+
+integration_list <- list(combined, pbmc_integrated)
+
+anchors <- FindIntegrationAnchors(object.list = integration_list, dims = 1:30, reduction = "rpca")
+
+combined_integrated <- IntegrateData(anchorset = anchors, dims = 1:30)
+DefaultAssay(combined_integrated) <- "integrated"
+
+combined_integrated <- ScaleData(combined_integrated)
+combined_integrated <- RunPCA(combined_integrated, npcs = 50)
+combined_integrated <- RunUMAP(combined_integrated, dims = 1:50)
+combined_integrated <- FindNeighbors(combined_integrated, dims = 1:50)
+combined_integrated <- FindClusters(combined_integrated, resolution = 0.3)
+
+c <- DimPlot(combined_integrated, reduction = "umap", group.by = "seurat_clusters", label = TRUE) + ggtitle("Combined Integrated (RPCA)")
+
+
+markers <- FindAllMarkers(combined_integrated, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+
+top_markers <- markers %>%
+  group_by(cluster) %>%
+  top_n(n = 5, wt = avg_log2FC)
+
+head(top_markers)
+
+genes_to_plot <- c("PTPRC", "CD14", "FCGR3A", "CD3D", "IL7R", "CCR7", "CD8A", 
+                   "MKI67", "TRGC1", "NKG7", "CD79A", "CD38", "CD1C", "CLEC4C", 
+                   "PPBP", "CD34")
+
+vln_plot <- VlnPlot(combined_integrated, 
+                    features = genes_to_plot, 
+                    group.by = "seurat_clusters", 
+                    pt.size = 0, 
+                    stack = TRUE, 
+                    flip = TRUE) + 
+  ggtitle("Marker expression in clusters")
+
+vln_plot
+
+celltype_labels <- c(
+  "0"  = "Naive CD4+ T",
+  "1"  = "Unknown",
+  "2"  = "B",
+  "3"  = "CD14+ Mono",
+  "4"  = "Effector CD8+ T",
+  "5"  = "Naive CD8+ T",
+  "6"  = "Effector CD4+ T",
+  "7"  = "Unknown",
+  "8"  = "Unknown",
+  "9"  = "Unknown",
+  "10" = "NK",
+  "11" = "CD16+ Mono",
+  "12" = "Unknown",
+  "13" = "Unknown",
+  "14" = "Effector CD8+ T",
+  "15" = "Effector CD4+ T",
+  "16" = "Effector CD8+ T",
+  "17" = "CD16+ Mono",
+  "18" = "Unknown",
+  "19" = "MKI67+ CD8+ T",
+  "20" = "CD14+ Mono",
+  "21" = "mDC",
+  "22" = "CD16+ Mono",
+  "23" = "CD14+ Mono",
+  "24" = "Plasma B",
+  "25" = "CD16+ Mono",
+  "26" = "pDC",
+  "27" = "CD16+ Mono",
+  "28" = "Unknown"
+  )
+
+celltype_vec <- celltype_labels[as.character(Idents(combined_integrated))]
+names(celltype_vec) <- colnames(combined_integrated)
+combined_integrated <- AddMetaData(combined_integrated, metadata = celltype_vec, col.name = "celltype")
+combined_integrated$stage[is.na(combined_integrated$stage)] <- "influenza"
+
+p1 <- DimPlot(combined_integrated, reduction = "umap", group.by = "stage", label = FALSE, repel = TRUE) +
+  ggtitle("Combined Integrated (RPCA) - Stage")
+# ggsave("umap_by_stage.png", plot = p1, width = 10, height = 8, dpi = 300)
+
+p2 <- DimPlot(combined_integrated, reduction = "umap", group.by = "celltype", label = TRUE, repel = TRUE) +
+  ggtitle("Combined Integrated (RPCA) - Cell Types")
+# ggsave("umap_by_celltype.png", plot = p2, width = 10, height = 8, dpi = 300)
+
+DimPlot(combined_integrated, reduction = "umap", label = TRUE, repel = TRUE) +
+  ggtitle("Combined Integrated (RPCA) - Stage")
+
+cluster2_cells <- WhichCells(combined_integrated, idents = 2)
+cluster2 <- subset(combined_integrated, cells = cluster2_cells)
+
+DefaultAssay(cluster2) <- "RNA"
+cluster2 <- JoinLayers(cluster2, assay = "RNA")
+
+table(cluster2$stage)
+
+deg_influenza_vs_control <- FindMarkers(cluster2, 
+                                        ident.1 = "influenza", 
+                                        ident.2 = "Control",
+                                        group.by = "stage",
+                                        logfc.threshold = 0.25,
+                                        min.pct = 0.1)
+
+deg_severe_vs_control <- FindMarkers(cluster2, 
+                                     ident.1 = "severe", 
+                                     ident.2 = "Control",
+                                     group.by = "stage",
+                                     logfc.threshold = 0.25,
+                                     min.pct = 0.1)
+
+deg_severe_vs_influenza <- FindMarkers(cluster2, 
+                                       ident.1 = "severe", 
+                                       ident.2 = "influenza",
+                                       group.by = "stage",
+                                       logfc.threshold = 0.25,
+                                       min.pct = 0.1)
+
+top_influenza_vs_control <- deg_influenza_vs_control %>% arrange(desc(avg_log2FC)) %>% head(20) %>% rownames()
+top_severe_vs_control <- deg_severe_vs_control %>% arrange(desc(avg_log2FC)) %>% head(20) %>% rownames()
+top_severe_vs_influenza <- deg_severe_vs_influenza %>% arrange(desc(avg_log2FC)) %>% head(20) %>% rownames()
+
+genes_to_plot <- unique(c(top_influenza_vs_control, top_severe_vs_control, top_severe_vs_influenza))
+
+cluster2 <- ScaleData(cluster2, features = genes_to_plot)
+
+scale_mat <- GetAssayData(cluster2, assay = "RNA", slot = "scale.data")
+expr_matrix <- scale_mat[genes_to_plot, ]
+
+set.seed(123)
+
+max_cells_per_group <- 40
+
+groups <- unique(cluster2$stage)
+
+cells_to_plot <- unlist(lapply(groups, function(g) {
+  cells_in_group <- WhichCells(cluster2, expression = stage == g)
+  if(length(cells_in_group) > max_cells_per_group) {
+    sample(cells_in_group, max_cells_per_group)
+  } else {
+    cells_in_group
+  }
+}))
+
+expr_matrix_subset <- expr_matrix[, cells_to_plot]
+
+annotation_col <- data.frame(stage = cluster2$stage[cells_to_plot])
+rownames(annotation_col) <- cells_to_plot
+
+png("heatmap_cluster2_clustered.png", width = 1600, height = 1300, res = 150)
+pheatmap(expr_matrix_subset,
+         cluster_rows = TRUE,
+         cluster_cols = TRUE,
+         show_rownames = TRUE,
+         show_colnames = FALSE,
+         annotation_col = annotation_col,
+         scale = "row",
+         main = "Differential expression in clutser 2")
+dev.off()
+
+```
+```{r last_analyis}
+cells_cluster20 <- WhichCells(combined_integrated, idents = 20)
+cluster20 <- subset(combined_integrated, cells = cells_cluster20)
+
+mono_clusters <- c(3, 11, 17, 20, 23, 25, 27)
+
+all_monocytes <- subset(combined_integrated, idents = mono_clusters)
+all_monocytes$cluster_label <- as.character(Idents(all_monocytes)) 
+all_monocytes <- JoinLayers(all_monocytes)
+
+clusters_to_compare <- unique(all_monocytes$cluster_label)
+
+pairwise_de_results <- list()
+
+for (i in seq_along(clusters_to_compare)) {
+  for (j in seq_along(clusters_to_compare)) {
+    if (i < j) { 
+      c1 <- clusters_to_compare[i]
+      c2 <- clusters_to_compare[j]
+      
+      de_res <- FindMarkers(all_monocytes, ident.1 = c1, ident.2 = c2, group.by = "cluster_label",
+                            logfc.threshold = 0.25, min.pct = 0.1)
+      de_res$comparison <- paste0(c1, "_vs_", c2)
+      de_res$gene <- rownames(de_res)
+      
+      pairwise_de_results[[paste0(c1, "_vs_", c2)]] <- de_res
+    }
+  }
+}
+
+all_de <- bind_rows(pairwise_de_results)
+
+top_genes <- all_de %>%
+  group_by(comparison) %>%
+  slice_max(order_by = avg_log2FC, n = 3) %>%
+  pull(gene) %>%
+  unique()
+
+DefaultAssay(all_monocytes) <- "RNA"
+all_monocytes <- ScaleData(all_monocytes, features = top_genes) 
+
+expr_mat <- GetAssayData(all_monocytes, slot = "scale.data")[top_genes, ]
+
+cells_to_plot <- all_monocytes@meta.data %>%
+  rownames_to_column(var = "cell") %>%
+  filter(cluster_label %in% clusters_to_compare) %>%
+  group_by(cluster_label) %>%
+  sample_n(size = min(500, n()), replace = FALSE) %>%
+  pull(cell)
+
+expr_mat_subset <- expr_mat[, cells_to_plot]
+
+annotation_col <- all_monocytes@meta.data[cells_to_plot, "cluster_label", drop = FALSE]
+
+library(pheatmap)
+
+pheatmap(expr_mat_subset,
+         cluster_rows = TRUE,
+         cluster_cols = FALSE,
+         show_rownames = TRUE,
+         show_colnames = FALSE,
+         annotation_col = annotation_col,
+         scale = "row",
+         main = "Pairwise DE top genes across monocyte clusters")
+
+
+combined_integrated <- readRDS("combined_integrated.rds")
+
+png("dotplot.png", width = 2000, height = 1000, res = 150)
+DotPlot(all_monocytes, features = top_genes, group.by = "cluster_label") +
+  RotatedAxis() +   theme(axis.text.x = element_text(size = 10))  
+dev.off()
+
+# saveRDS(all_monocytes, file = "all_monocytes.rds")
+# saveRDS(combined_integrated, file = "combined_integrated.rds")
+
+```
+
+```{r covid_comparison}
+
+covid_samples <-  list(
+  PSF1A = "~/Studia/StudiaMagisterskie/Bioinformatyka/RokISemII/CBS/cbs/project/new_covid/GSM5671320_PSF1a_all_counts.txt/GSM5671320_PSF1a_all_counts.txt",
+  PSF1B = "~/Studia/StudiaMagisterskie/Bioinformatyka/RokISemII/CBS/cbs/project/new_covid/GSM5671321_PSF1b_all_counts.txt/GSM5671321_PSF1b_all_counts.txt",
+  PSF1C = "~/Studia/StudiaMagisterskie/Bioinformatyka/RokISemII/CBS/cbs/project/new_covid/GSM5671322_PSF1c_all_counts.txt/GSM5671322_PSF1c_all_counts.txt",
+  PSF2A = "~/Studia/StudiaMagisterskie/Bioinformatyka/RokISemII/CBS/cbs/project/new_covid/GSM5671323_PSF2a_all_counts.txt/GSM5671323_PSF2a_all_counts.txt",
+  PSF2B = "~/Studia/StudiaMagisterskie/Bioinformatyka/RokISemII/CBS/cbs/project/new_covid/GSM5671324_PSF2b_all_counts.txt/GSM5671324_PSF2b_all_counts.txt",
+  PSF2C = "~/Studia/StudiaMagisterskie/Bioinformatyka/RokISemII/CBS/cbs/project/new_covid/GSM5671325_PSF2c_all_counts.txt/GSM5671325_PSF2c_all_counts.txt",
+  PSF3A = "~/Studia/StudiaMagisterskie/Bioinformatyka/RokISemII/CBS/cbs/project/new_covid/GSM5671326_PSF3a_all_counts.txt/GSM5671326_PSF3a_all_counts.txt",
+  PSF3B = "~/Studia/StudiaMagisterskie/Bioinformatyka/RokISemII/CBS/cbs/project/new_covid/GSM5671327_PSF3b_all_counts.txt/GSM5671327_PSF3b_all_counts.txt",
+  PSF4A = "~/Studia/StudiaMagisterskie/Bioinformatyka/RokISemII/CBS/cbs/project/new_covid/GSM5671328_PSF4a_all_counts.txt/GSM5671328_PSF4a_all_counts.txt",
+  PSF4B = "~/Studia/StudiaMagisterskie/Bioinformatyka/RokISemII/CBS/cbs/project/new_covid/GSM5671329_PSF4b_all_counts.txt/GSM5671329_PSF4b_all_counts.txt",
+  PSF5A = "~/Studia/StudiaMagisterskie/Bioinformatyka/RokISemII/CBS/cbs/project/new_covid/GSM5671330_PSF5a_all_counts.txt/GSM5671330_PSF5a_all_counts.txt",
+  PSF5B = "~/Studia/StudiaMagisterskie/Bioinformatyka/RokISemII/CBS/cbs/project/new_covid/GSM5671331_PSF5b_all_counts.txt/GSM5671331_PSF5b_all_counts.txt",
+  PSF6A = "~/Studia/StudiaMagisterskie/Bioinformatyka/RokISemII/CBS/cbs/project/new_covid/GSM5671332_PSF6a_all_counts.txt/GSM5671332_PSF6a_all_counts.txt",
+  PSF6B = "~/Studia/StudiaMagisterskie/Bioinformatyka/RokISemII/CBS/cbs/project/new_covid/GSM5671333_PSF6b_all_counts.txt/GSM5671333_PSF6b_all_counts.txt"
+)
+
+
+seurat_list_covid <- lapply(names(covid_samples), function(id) {
+  print(id)
+  data <- read.table(covid_samples[[id]], header = TRUE, row.names = 1, sep = "\t", check.names = FALSE)
+  seu <- CreateSeuratObject(counts = data, project = id)
+  seu$SampleID <- id
+  seu$Condition <- substr(id, 1, 4)  
+  return(seu)
+})
+
+combined_covid <- merge(seurat_list_covid[[1]], y = seurat_list_covid[-1], add.cell.ids = names(covid_samples))
+
+combined_covid <- NormalizeData(combined_covid)
+combined_covid <- FindVariableFeatures(combined_covid)
+combined_covid <- ScaleData(combined_covid)
+combined_covid <- RunPCA(combined_covid)
+combined_covid <- FindNeighbors(combined_covid, dims = 1:10)
+combined_covid <- FindClusters(combined_covid, resolution = 0.5)
+combined_covid <- RunUMAP(combined_covid, dims = 1:10)
+
+pbmc_integrated <- readRDS("pbmc_integrated_1.rds")
+
+integration_list_covid <- list(combined_covid, pbmc_integrated)
+
+anchors_covid <- FindIntegrationAnchors(object.list = integration_list_covid, dims = 1:30, reduction = "rpca")
+
+combined_integrated_covid <- IntegrateData(anchorset = anchors_covid, dims = 1:30)
+DefaultAssay(combined_integrated_covid) <- "integrated"
+
+combined_integrated_covid <- ScaleData(combined_integrated_covid)
+combined_integrated_covid <- RunPCA(combined_integrated_covid, npcs = 50)
+combined_integrated_covid <- RunUMAP(combined_integrated_covid, dims = 1:50)
+combined_integrated_covid <- FindNeighbors(combined_integrated_covid, dims = 1:50)
+combined_integrated_covid <- FindClusters(combined_integrated_covid, resolution = 0.3)
+
+combined_integrated_covid$stage <- as.character(combined_integrated_covid$stage)  
+combined_integrated_covid$stage[is.na(combined_integrated_covid$stage)] <- "other_covid"
+
+
+genes_to_plot <- c("PTPRC", "CD14", "FCGR3A", "CD3D", "IL7R", "CCR7", "CD8A", 
+                   "MKI67", "TRGC1", "NKG7", "CD79A", "CD38", "CD1C", "CLEC4C", 
+                   "PPBP", "CD34")
+
+vln_plot <- VlnPlot(combined_integrated_covid, 
+                    features = genes_to_plot, 
+                    group.by = "seurat_clusters", 
+                    pt.size = 0, 
+                    stack = TRUE, 
+                    flip = TRUE) + 
+  ggtitle("Marker expression in clusters")
+
+vln_plot
+
+celltype_labels <- c(
+  "0"  = "Naive CD4+ T",
+  "1"  = "CD14+ Mono",
+  "2"  = "Effector CD8+ T",
+  "3"  = "Naive CD4+ T",
+  "4"  = "Naive CD8+ T",
+  "5"  = "Naive CD4+ T",
+  "6"  = "Unknown",
+  "7"  = "NK",
+  "8"  = "B",
+  "9"  = "B",
+  "10" = "CD14+ Mono",
+  "11" = "Unknown",
+  "12" = "gdT",
+  "13" = "Unknown",
+  "14" = "CD14+ Mono",
+  "15" = "CD14+ Mono",
+  "16" = "MKI67+ CD8+ T",
+  "17" = "mDC",
+  "18" = "CD16+ Mono",
+  "19" = "CD14+ Mono",
+  "20" = "Plasma B",
+  "21" = "pDC",
+  "22" = "Progenitor"
+  )
+
+combined_integrated_covid$celltype <- plyr::mapvalues(
+  x = combined_integrated_covid$seurat_clusters,
+  from = names(celltype_labels),
+  to = celltype_labels
+)
+
+# combined_integrated_covid$celltype <- factor(combined_integrated_covid$seurat_clusters,
+#                                             levels = names(celltype_labels),
+#                                             labels = celltype_labels)
+
+combined_integrated_covid <- readRDS("combined_integrated_covid.rds")
+
+p1 <- DimPlot(combined_integrated_covid, reduction = "umap", group.by = "celltype", label = TRUE) + 
+  ggtitle("COVID samples integrated with PBMC (RPCA) - cell types")
+
+p2 <- DimPlot(combined_integrated_covid, reduction = "umap", group.by = "stage", label = FALSE) + 
+  ggtitle("COVID samples integrated with PBMC (RPCA)")
+
+
+DimPlot(combined_integrated_covid, reduction = "umap", label = TRUE) + 
+  ggtitle("COVID samples integrated with PBMC (RPCA) - cell types")
+
+png("dimplot_celltype.png", width = 800, height = 600)
+print(p1)
+dev.off()
+
+png("dimplot_stage.png", width = 800, height = 600)
+print(p2)
+dev.off()
+
+# saveRDS(combined_integrated_covid, file = "combined_integrated_covid.rds")
+
+
+```
